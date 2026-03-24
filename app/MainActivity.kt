@@ -15,12 +15,21 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.example.photogrammetryapp.data.UploadRepository
+import com.example.photogrammetryapp.ml.ShapeAggregator
+import com.example.photogrammetryapp.ml.ShapeClassifier
+import com.example.photogrammetryapp.ml.ShapePrediction
 import com.example.photogrammetryapp.utils.UriFileMapper
 import com.example.photogrammetryapp.utils.ZipUtil
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
@@ -41,6 +50,10 @@ class MainActivity : AppCompatActivity() {
 
     private val repository by lazy {
         UploadRepository(client, SERVER_URL)
+    }
+
+    private val shapeClassifier by lazy {
+        ShapeClassifier(this)
     }
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -80,8 +93,9 @@ class MainActivity : AppCompatActivity() {
                 val clip = result.data?.clipData
 
                 if (clip != null) {
-                    for (i in 0 until clip.itemCount)
+                    for (i in 0 until clip.itemCount) {
                         uris.add(clip.getItemAt(i).uri)
+                    }
                 } else {
                     result.data?.data?.let { uris.add(it) }
                 }
@@ -114,25 +128,30 @@ class MainActivity : AppCompatActivity() {
     private fun processImages(uris: List<Uri>) {
         scope.launch {
             try {
-                setStatus("Preparing files...", true)
+                setStatus("Analyzing shapes on selected photos...", true)
 
-                // 1️⃣ Uri → File
+                val perPhotoPredictions = withContext(Dispatchers.IO) {
+                    uris.map { uri -> shapeClassifier.classifyUri(this@MainActivity, uri) }
+                }
+                val finalPrediction = ShapeAggregator.aggregate(perPhotoPredictions)
+
+                val objectStatus = buildPredictionMessage(perPhotoPredictions, finalPrediction)
+                setStatus("$objectStatus\nPreparing files...", true)
+
                 val files = withContext(Dispatchers.IO) {
                     uris.map { uri ->
                         UriFileMapper.uriToFile(this@MainActivity, uri)
                     }
                 }
 
-                setStatus("Compressing images...", true)
+                setStatus("$objectStatus\nCompressing images...", true)
 
-                // 2️⃣ Создание ZIP на телефоне
                 val zipFile = withContext(Dispatchers.IO) {
                     ZipUtil.createZip(files)
                 }
 
-                setStatus("Processing on server (Wait 5-10m)...", true)
+                setStatus("$objectStatus\nProcessing on server (Wait 5-10m)...", true)
 
-                // 3️⃣ Отправка на сервер
                 val result = withContext(Dispatchers.IO) {
                     repository.upload(zipFile)
                 }
@@ -141,17 +160,32 @@ class MainActivity : AppCompatActivity() {
                     val bytes = result.getOrNull()
                     if (bytes != null) {
                         val modelFile = saveModel(bytes)
-                        setStatus("Done!", false)
+                        setStatus("$objectStatus\nDone!", false)
                         loadModelInWebView(modelFile)
                     }
                 } else {
-                    setStatus("Error: ${result.exceptionOrNull()?.message}", false)
+                    setStatus("$objectStatus\nError: ${result.exceptionOrNull()?.message}", false)
                 }
 
             } catch (e: Exception) {
                 setStatus("Error: ${e.message}", false)
             }
         }
+    }
+
+    private fun buildPredictionMessage(
+        perPhotoPredictions: List<ShapePrediction>,
+        finalPrediction: ShapePrediction?
+    ): String {
+        if (perPhotoPredictions.isEmpty() || finalPrediction == null) {
+            return "Object recognition: no prediction"
+        }
+
+        val votes = perPhotoPredictions.count { it.label == finalPrediction.label }
+        val total = perPhotoPredictions.size
+        val confidence = String.format(Locale.US, "%.2f", finalPrediction.confidence)
+
+        return "Object recognition: ${finalPrediction.label} ($votes/$total, conf=$confidence)"
     }
 
     private fun saveModel(bytes: ByteArray): File {
@@ -205,6 +239,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        shapeClassifier.close()
         super.onDestroy()
         scope.cancel()
     }
